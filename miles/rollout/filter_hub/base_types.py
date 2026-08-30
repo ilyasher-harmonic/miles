@@ -1,5 +1,8 @@
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass
+
+from miles.utils.types import Sample
 
 
 @dataclass
@@ -8,11 +11,22 @@ class DynamicFilterOutput:
     reason: str | None = None
 
 
-def call_dynamic_filter(fn, *args, **kwargs):
+def iter_samples(samples: list[Sample | list[Sample]]) -> Iterator[Sample]:
+    for sample in samples:
+        if isinstance(sample, list):
+            yield from sample
+        else:
+            yield sample
+
+
+def call_dynamic_filter(fn, args, samples: list[Sample | list[Sample]], **kwargs):
+    if any(sample.reward is None or sample.get_reward_value(args) is None for sample in iter_samples(samples)):
+        return DynamicFilterOutput(keep=False, reason="group_has_missing_reward")
+
     if fn is None:
         return DynamicFilterOutput(keep=True)
 
-    output = fn(*args, **kwargs)
+    output = fn(args, samples, **kwargs)
 
     # compatibility for legacy version
     if not isinstance(output, DynamicFilterOutput):

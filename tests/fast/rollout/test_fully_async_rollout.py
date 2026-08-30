@@ -79,6 +79,7 @@ def make_args(**overrides) -> Namespace:
         custom_async_data_buffer_path=None,
         rollout_submission_granularity=None,
         dynamic_sampling_filter_path=None,
+        reward_key=None,
         rollout_sample_filter_path=None,
         sglang_router_ip="127.0.0.1",
         sglang_router_port=30000,
