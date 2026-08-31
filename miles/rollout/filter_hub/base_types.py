@@ -11,8 +11,8 @@ class DynamicFilterOutput:
     reason: str | None = None
 
 
-def iter_samples(samples: list[Sample | list[Sample]]) -> Iterator[Sample]:
-    for sample in samples:
+def iter_samples(group: list[Sample | list[Sample]]) -> Iterator[Sample]:
+    for sample in group:
         if isinstance(sample, list):
             yield from sample
         else:

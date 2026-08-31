@@ -11,10 +11,10 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from argparse import Namespace
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 
-from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
+from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, iter_samples
 from miles.utils.misc import load_function
 from miles.utils.types import Sample
 
@@ -23,14 +23,6 @@ logger = logging.getLogger(__name__)
 # A finished group is list[Sample], or list[list[Sample]] when a generate function
 # returns multiple samples per trajectory (e.g. multi-agent).
 Group = list[Sample | list[Sample]]
-
-
-def iter_samples(group: Group) -> Iterator[Sample]:
-    for item in group:
-        if isinstance(item, list):
-            yield from item
-        else:
-            yield item
 
 
 def first_sample(group: Group) -> Sample:
