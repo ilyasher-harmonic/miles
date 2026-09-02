@@ -64,6 +64,7 @@ GLOBAL_BATCH_SIZE_FLAG: str = "--global-batch-size"
 ROLLOUT_BATCH_SIZE_FLAG: str = "--rollout-batch-size"
 SAMPLES_PER_PROMPT_FLAG: str = "--n-samples-per-prompt"
 ASYNC_SAVE_FLAG: str = "--async-save"
+SIDE_RUN_ID_DIGEST_LENGTH: int = 8
 _WEIGHT_VERSION_METRIC_KEYS: tuple[str, ...] = tuple(
     f"rollout/weight_version/{statistic}" for statistic in ("mean", "median", "max", "min")
 )
@@ -155,9 +156,17 @@ def _config_for_comparison_side(
     side: str, config: command_utils.ExecuteTrainConfig
 ) -> command_utils.ExecuteTrainConfig:
     assert side in (BASELINE_SIDE, TARGET_SIDE), f"unknown comparison side {side!r}"
+    return dataclasses.replace(config, run_id=_compute_side_run_id(config.run_id, side=side))
+
+
+def _compute_side_run_id(parent_run_id: str, *, side: str) -> str:
     suffix = f"-{side}"
-    parent_run_id = config.run_id[: RUN_ID_MAX_LENGTH - len(suffix)]
-    return dataclasses.replace(config, run_id=f"{parent_run_id}{suffix}")
+    room = RUN_ID_MAX_LENGTH - len(suffix)
+    if len(parent_run_id) <= room:
+        return f"{parent_run_id}{suffix}"
+
+    digest = hashlib.sha256(parent_run_id.encode()).hexdigest()[:SIDE_RUN_ID_DIGEST_LENGTH]
+    return f"{parent_run_id[: room - len(digest) - 1]}-{digest}{suffix}"
 
 
 # ========================== train argument building ===========================

@@ -66,6 +66,24 @@ class TestComparisonReleaseIsolation:
         assert len(target.run_id) <= RUN_ID_MAX_LENGTH
         assert config.run_id == "a" * RUN_ID_MAX_LENGTH
 
+    def test_two_parents_that_share_a_prefix_do_not_share_a_side_release(self):
+        """Truncation alone dropped the only part telling two long parent run ids apart."""
+        one = ExecuteTrainConfig(run_id="a" * RUN_ID_MAX_LENGTH + "-one")
+        another = ExecuteTrainConfig(run_id="a" * RUN_ID_MAX_LENGTH + "-two")
+
+        for side in (BASELINE_SIDE, TARGET_SIDE):
+            first = scenario._config_for_comparison_side(side, one)
+            second = scenario._config_for_comparison_side(side, another)
+
+            assert first.run_id != second.run_id
+            assert len(first.run_id) <= RUN_ID_MAX_LENGTH and len(second.run_id) <= RUN_ID_MAX_LENGTH
+
+    def test_a_parent_short_enough_to_carry_the_suffix_keeps_its_whole_id(self):
+        """A readable side release name is what makes a stuck run findable in the namespace."""
+        config = ExecuteTrainConfig(run_id="demo")
+
+        assert scenario._config_for_comparison_side(TARGET_SIDE, config).run_id == f"demo-{TARGET_SIDE}"
+
 
 class TestTiming:
     def test_the_scenario_pins_a_freeze_for_every_restart_it_drives(self):

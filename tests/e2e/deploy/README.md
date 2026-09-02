@@ -60,8 +60,10 @@ Releases: TRAINER solver-actor / verifier-actor, INFERENCE solver / verifier, PR
 ```
 Type: comparison (baseline=untouched, target=same command, orchestration script replaced mid-run)
 Steps: 6 rollouts
-Releases: baseline and target derive separate releases from the parent run id; every target
-          take-over upgrades the target release in place
+Releases: baseline and target derive separate releases from the parent run id - a parent too
+          long to carry the side suffix keeps a prefix plus a digest of the whole id, so two
+          parents sharing a prefix cannot name the same side release; every target take-over
+          upgrades the target release in place
 Timing: exact - the run parks at the scheduled step boundary (sleep-forever action) and the
         driver relaunches it there, so a take-over's landing is pinned, not raced
 Plan: a file under the base dump dir, not under either side's, which each run deletes (argv
