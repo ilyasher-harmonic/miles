@@ -59,17 +59,49 @@ class TestShutdownWorkerManager:
         ids=lambda path: path.name,
     )
     def test_every_finite_driver_shuts_down_the_manager_it_launched(self, script: Path) -> None:
-        """Every driver that owns a worker manager must release that same manager on its normal return path."""
+        """Every driver that owns a worker manager must release that same manager on every exit path."""
         calls = [
             node
             for node in ast.walk(ast.parse(script.read_text(), filename=str(script)))
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "shutdown_worker_manager"
+            and node.func.id == "shutting_down_worker_manager"
         ]
 
         assert len(calls) == 1
-        assert ast.unparse(calls[0]) == "shutdown_worker_manager(_worker_manager)"
+        assert ast.unparse(calls[0]) == "shutting_down_worker_manager(worker_manager)"
+
+
+class TestShuttingDownWorkerManager:
+    async def test_the_manager_is_released_when_the_driver_body_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A raise from training used to skip the shutdown, leaving the worker process trees unreaped."""
+        shut_down: list[object] = []
+        manager = object()
+        monkeypatch.setattr(wiring, "shutdown_worker_manager", lambda handle: _resolved(shut_down, handle))
+
+        with pytest.raises(ValueError, match="training failed"):
+            async with wiring.shutting_down_worker_manager(manager):
+                raise ValueError("training failed")
+
+        assert shut_down == [manager]
+
+    async def test_a_failing_teardown_does_not_hide_the_failure_it_cleans_up_after(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Raising the teardown error instead would replace the training failure that is the real root cause."""
+        monkeypatch.setattr(wiring, "shutdown_worker_manager", _refuse_shutdown)
+
+        with pytest.raises(ValueError, match="training failed"):
+            async with wiring.shutting_down_worker_manager(object()):
+                raise ValueError("training failed")
+
+    async def test_a_failing_teardown_of_a_finished_run_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Nothing else is leaving, so a manager that will not shut down is the failure of the run."""
+        monkeypatch.setattr(wiring, "shutdown_worker_manager", _refuse_shutdown)
+
+        with pytest.raises(RuntimeError, match="shutdown refused"):
+            async with wiring.shutting_down_worker_manager(object()):
+                pass
 
 
 class TestGetBackendCapability:
@@ -140,3 +172,7 @@ def stub_kubernetes_capability(monkeypatch: pytest.MonkeyPatch) -> KubernetesCap
 
 def _refuse_ray(args: Any) -> None:
     raise AssertionError("the Kubernetes path must not launch Ray workers")
+
+
+async def _refuse_shutdown(worker_manager_handle: Any) -> None:
+    raise RuntimeError("shutdown refused")

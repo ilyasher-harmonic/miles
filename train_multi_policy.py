@@ -6,10 +6,10 @@ import os
 from argparse import Namespace
 from pathlib import Path
 
-from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
+from miles.backends.megatron_utils.megatron_config import MegatronConfig, resolve_megatron_config
 from miles.ray.placement_group import create_rollout_components, maybe_start_api_server, update_weights
 from miles.ray.specs.train import compute_trainer_configs
-from miles.ray.wiring import shutdown_worker_manager
+from miles.ray.wiring import shutting_down_worker_manager
 from miles.utils.arguments import parse_args
 from miles.utils.async_utils import wait_cancelling_pending_on_first_completion
 from miles.utils.data import remove_rollout_data_refs
@@ -35,6 +35,11 @@ async def train_multi_policy(args) -> None:
     megatron_config = resolve_megatron_config(args)
     validate_multi_policy_args(args, megatron_config=megatron_config)
     worker_manager = init_orchestration_script(args)
+    async with shutting_down_worker_manager(worker_manager):
+        await _train_multi_policy(args, megatron_config=megatron_config)
+
+
+async def _train_multi_policy(args, *, megatron_config: MegatronConfig) -> None:
     define_policy_metric_groups(megatron_config)
 
     inference_controller, rollout_executor, num_rollout_per_epoch = await create_rollout_components(args)
@@ -102,7 +107,6 @@ async def train_multi_policy(args) -> None:
     await inference_controller.dispose()
     for trainer in trainers.values():
         await trainer.handle.dispose()
-    await shutdown_worker_manager(worker_manager)
 
 
 def _startup_args(args, *, trainer: TrainerInfo) -> Namespace:

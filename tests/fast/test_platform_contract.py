@@ -25,7 +25,7 @@ ORCHESTRATION_SCRIPTS = ("train.py", "train_async.py", "train_multi_lora_async.p
 
 BACKEND_CAPABILITY_FN = "launch_worker_manager"
 ORCHESTRATION_INIT_FN = "init_orchestration_script"
-BACKEND_NEUTRAL_WIRING_NAMES = {"shutdown_worker_manager"}
+BACKEND_NEUTRAL_WIRING_NAMES = {"shutdown_worker_manager", "shutting_down_worker_manager"}
 
 UPPER_LAYER_MODULES = (
     "kubernetes",

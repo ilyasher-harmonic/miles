@@ -10,7 +10,7 @@ from miles.ray.placement_group import (
     maybe_start_api_server,
     update_weights,
 )
-from miles.ray.wiring import shutdown_worker_manager
+from miles.ray.wiring import shutting_down_worker_manager
 from miles.utils.arguments import parse_args
 from miles.utils.data import remove_rollout_data_refs, remove_train_output_refs
 from miles.utils.ft_utils.mini_ft_controller import maybe_start_mini_ft_controller
@@ -24,7 +24,11 @@ logger = logging.getLogger(__name__)
 async def train(args):
     assert not args.fully_async, "--fully-async requires the async driver: run train_async.py"
     worker_manager = init_orchestration_script(args)
+    async with shutting_down_worker_manager(worker_manager):
+        await _train(args)
 
+
+async def _train(args):
     # create the rollout manager, with sglang engines inside.
     # need to initialize rollout manager first to calculate num_rollout
     inference_controller, rollout_executor, num_rollout_per_epoch = await create_rollout_components(args)
@@ -144,7 +148,6 @@ async def train(args):
     await actor_model.dispose()
     if critic_model is not None:
         await critic_model.dispose()
-    await shutdown_worker_manager(worker_manager)
 
 
 if __name__ == "__main__":
