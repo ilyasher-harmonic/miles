@@ -3478,6 +3478,7 @@ def miles_validate_args(args):
         if args.opd_teacher_urls:
             raise ValueError("--opd-teacher-urls is set but --use-opd is not enabled. Please add --use-opd flag.")
 
+    args.requested_load = args.load
     if args.megatron_config is None:
         resolve_args_checkpoint_load(args)
 
