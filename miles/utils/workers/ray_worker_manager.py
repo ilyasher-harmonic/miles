@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 _ACTOR_NAME = "ray_worker_manager"
 
 _LIVENESS_SCAN_INTERVAL_SECONDS = 10.0
+_CELL_START_TIMEOUT_SECONDS = 3600.0
 
 
 class RayWorkerManager:
@@ -86,9 +87,7 @@ class RayWorkerManager:
         async with self._membership_lock:
             cells = [cell for cell_id in cell_ids if (cell := self._find_cell(cell_id)).actors is None]
             try:
-                await _gather_or_raise([c.launch_actors() for c in cells])
-                await _gather_or_raise([c.alloc_ports() for c in cells])
-                await _gather_or_raise([c.post_setup() for c in cells])
+                await asyncio.wait_for(_bring_cells_up(cells), timeout=_CELL_START_TIMEOUT_SECONDS)
             except Exception:
                 logger.error(f"Starting cells {[c.cell_id for c in cells]} failed, rolling back", exc_info=True)
                 await asyncio.gather(*[c.stop() for c in cells], return_exceptions=True)
@@ -558,6 +557,12 @@ def _ctor_context(launch_context: WorkerLaunchContext) -> WorkerCtorContext:
 
 def _create_ray_backend_capability() -> BackendCapability:
     return RayBackendCapability(worker_manager_handle=RayWorkerManager.get_handle())
+
+
+async def _bring_cells_up(cells: list[_CellManager]) -> None:
+    await _gather_or_raise([c.launch_actors() for c in cells])
+    await _gather_or_raise([c.alloc_ports() for c in cells])
+    await _gather_or_raise([c.post_setup() for c in cells])
 
 
 async def _gather_or_raise(coros: list[Coroutine[Any, Any, None]]) -> None:
