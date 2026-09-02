@@ -190,7 +190,7 @@ def test_kubernetes_side_waits_for_its_pods_after_helm_no_longer_lists_the_relea
     )
     monkeypatch.setattr(app_module.time, "sleep", lambda seconds: events.append(f"sleep:{seconds}"))
 
-    app_module._release_comparison_side(_request(config))
+    app_module.release_comparison_side(_request(config))
 
     assert events == [
         "uninstall:ci/miles-run-run-baseline-all",
@@ -217,7 +217,7 @@ def test_kubernetes_side_fails_after_a_bounded_wait_for_terminating_pods(
     monkeypatch.setattr(app_module, "selected_pods", lambda namespace, selector: [pod])
 
     with pytest.raises(TimeoutError, match="stuck-gpu-pod"):
-        app_module._release_comparison_side(_request(config))
+        app_module.release_comparison_side(_request(config))
 
 
 def test_ray_side_never_calls_kubernetes_release_tools(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -229,7 +229,7 @@ def test_ray_side_never_calls_kubernetes_release_tools(monkeypatch: pytest.Monke
         lambda **_kwargs: pytest.fail("Ray comparison side touched Helm"),
     )
 
-    app_module._release_comparison_side(_request(config))
+    app_module.release_comparison_side(_request(config))
 
 
 def test_a_fixed_topology_generate_data_runs_without_a_mode(monkeypatch: pytest.MonkeyPatch) -> None:

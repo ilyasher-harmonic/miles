@@ -34,6 +34,8 @@ Steps: 3 rollouts
    - installing PRIMARY blocks until the run ends
    - addresses from the example's address_book; ordering, shared run uuid and uninstall from
      conftest_deploy/split/split_deployment.py
+   - the side is released by the same deployment list that installed it, PRIMARY included, so
+     the handoff waits for every pod of the split run rather than for a release nothing installed
 3. Compare: dumps and metrics bitwise; engine checksums identical per (rollout, engine); engine
    count; weights moved; nonzero gradients >= 2 rollouts
 ```

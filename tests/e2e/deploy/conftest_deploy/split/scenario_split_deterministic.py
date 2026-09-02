@@ -15,7 +15,11 @@ from tests.e2e.deploy.conftest_deploy.common.example_args import (
     without_weight_decay,
 )
 from tests.e2e.deploy.conftest_deploy.common.utils import compare_deterministic_sides, run_on_a_cluster
-from tests.e2e.deploy.conftest_deploy.split.split_deployment import RunDeployment, create_split_run_side
+from tests.e2e.deploy.conftest_deploy.split.split_deployment import (
+    RunDeployment,
+    create_split_release_side,
+    create_split_run_side,
+)
 from tests.e2e.ft.conftest_ft.app import BASELINE_SIDE, TARGET_SIDE, RunSideRequest, create_comparison_app_and_run_ci
 from tests.e2e.ft.conftest_ft.execution import DATA_DIR, MODEL_DIR
 from tests.e2e.ft.conftest_ft.modes import DENSE_MODEL_HF_REPO, DENSE_MODEL_NAME, DENSE_MODEL_TYPE, FTTestMode
@@ -123,6 +127,7 @@ def _create_app_and_run_ci() -> tuple[typer.Typer, Callable[[], None]]:
         build_target_args=_build_args,
         compare_fn=_compare,
         run_side=create_split_run_side(build_baseline_args=_build_baseline_args, build_deployments=_build_deployments),
+        release_side=create_split_release_side(build_deployments=_build_deployments),
         resolve_mode_fn=lambda _name: _MODE,
     )
     return app, run_on_a_cluster(run_ci)

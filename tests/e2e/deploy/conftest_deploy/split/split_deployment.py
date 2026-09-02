@@ -5,7 +5,15 @@ import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from tests.e2e.ft.conftest_ft.app import TARGET_SIDE, RunSideFn, RunSideRequest, run_one_release
+from tests.e2e.ft.conftest_ft.app import (
+    TARGET_SIDE,
+    ReleaseSideFn,
+    RunSideFn,
+    RunSideRequest,
+    release_comparison_side,
+    remove_release_and_wait,
+    run_one_release,
+)
 from tests.e2e.ft.conftest_ft.execution import run_training
 from tests.e2e.ft.conftest_ft.modes import FTTestMode
 
@@ -13,7 +21,7 @@ from miles.utils.external_utils import command_utils
 from miles.utils.external_utils.command_utils.helm_backend.launcher.command_wrapper import Helm
 from miles.utils.external_utils.command_utils.helm_backend.naming import ReleaseName
 from miles.utils.run_uuid import generate_run_uuid
-from miles.utils.workers.types import DeployComponent
+from miles.utils.workers.types import ClusterBackend, DeployComponent
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +67,23 @@ def create_split_run_side(
         )
 
     return run_side
+
+
+def create_split_release_side(*, build_deployments: BuildDeploymentsFn) -> ReleaseSideFn:
+    def release_side(request: RunSideRequest) -> None:
+        if request.side != TARGET_SIDE:
+            release_comparison_side(request)
+            return
+
+        config = request.config
+        if config.cluster_backend is not ClusterBackend.KUBERNETES:
+            return
+
+        assert config.namespace, "pass a namespace: a split target side installs one release per deployment"
+        for deployment in reversed(build_deployments(request)):
+            remove_release_and_wait(release=deployment.release(config.run_id), namespace=config.namespace)
+
+    return release_side
 
 
 def create_launch_of_mode(mode: FTTestMode) -> LaunchDeploymentFn:

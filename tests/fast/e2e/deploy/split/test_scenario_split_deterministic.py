@@ -291,7 +291,8 @@ def pipeline(monkeypatch, tmp_path) -> _Pipeline:
         ft_app.run_one_release(request)
 
     def run_pipeline_without_release(**kwargs: Any) -> None:
-        run_pipeline(**kwargs, release_side=lambda _request: None)
+        kwargs["release_side"] = lambda _request: None
+        run_pipeline(**kwargs)
 
     monkeypatch.setattr(deploy_utils, "assert_the_cluster_can_deploy_runs", lambda config: None)
     monkeypatch.setattr(scenario, "_build_args", _fake_target_args)
@@ -394,5 +395,34 @@ class TestTheScenarioPipeline:
         assert not pipeline.launched
 
 
+class TestTheSideIsReleasedByWhatItInstalled:
+    def test_the_target_side_removes_every_release_its_deployments_named(self, mode, monkeypatch, deployments):
+        """The default handoff rebuilds one release name the split side never installed, so it waits for nothing."""
+        removed: list[str] = []
+        monkeypatch.setattr(
+            split_deployment, "remove_release_and_wait", lambda *, release, namespace: removed.append(release)
+        )
+
+        release_side = split_deployment.create_split_release_side(build_deployments=scenario._build_deployments)
+        release_side(_request(mode))
+
+        assert removed == [one.release(RUN_ID) for one in reversed(deployments)]
+
+    def test_the_baseline_side_is_released_the_way_an_unsplit_run_is(self, mode, monkeypatch):
+        """The baseline installs one release under its own config, which the default handoff already removes."""
+        sides: list[str] = []
+        monkeypatch.setattr(split_deployment, "release_comparison_side", lambda request: sides.append(request.side))
+        monkeypatch.setattr(split_deployment, "remove_release_and_wait", _refuse_to_remove)
+
+        release_side = split_deployment.create_split_release_side(build_deployments=scenario._build_deployments)
+        release_side(_request(mode, side=BASELINE_SIDE))
+
+        assert sides == [BASELINE_SIDE]
+
+
 def _refuse_the_cluster(config: ExecuteTrainConfig) -> None:
     raise AssertionError("no cluster here")
+
+
+def _refuse_to_remove(*, release: str, namespace: str) -> None:
+    raise AssertionError(f"the baseline side removed {release} itself instead of using the default handoff")

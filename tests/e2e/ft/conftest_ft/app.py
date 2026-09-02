@@ -74,30 +74,36 @@ def _dump_subdir(side: str, phase: str) -> str:
     return f"{side}/{phase}" if phase else side
 
 
-def _release_comparison_side(request: RunSideRequest) -> None:
+def release_comparison_side(request: RunSideRequest) -> None:
     config = request.config
     if config.cluster_backend is not ClusterBackend.KUBERNETES:
         return
 
     assert config.namespace, "A kubernetes comparison side needs a namespace before its release can be removed"
-    release = ReleaseName(
-        run_id=config.run_id,
-        deploy_component=config.deploy_component,
-        deploy_instance_id=config.deploy_instance_id,
-    ).serialize()
+    remove_release_and_wait(
+        release=ReleaseName(
+            run_id=config.run_id,
+            deploy_component=config.deploy_component,
+            deploy_instance_id=config.deploy_instance_id,
+        ).serialize(),
+        namespace=config.namespace,
+    )
+
+
+def remove_release_and_wait(*, release: str, namespace: str) -> None:
     selector = Kubectl.release_selector(release)
     deadline = time.monotonic() + _RELEASE_TIMEOUT_SECONDS
 
-    Helm.uninstall_if_present(release=release, namespace=config.namespace)
+    Helm.uninstall_if_present(release=release, namespace=namespace)
     while True:
-        manifest = Helm.get_manifest(release, config.namespace)
-        pods = selected_pods(config.namespace, selector)
+        manifest = Helm.get_manifest(release, namespace)
+        pods = selected_pods(namespace, selector)
         if manifest is None and not pods:
             return
         if time.monotonic() >= deadline:
             pod_names = sorted(pod.metadata.name for pod in pods)
             raise TimeoutError(
-                f"Timed out removing comparison release {release!r} from namespace {config.namespace!r}; "
+                f"Timed out removing comparison release {release!r} from namespace {namespace!r}; "
                 f"release_exists={manifest is not None}, pods={pod_names}"
             )
         time.sleep(_RELEASE_POLL_INTERVAL_SECONDS)
@@ -115,7 +121,7 @@ def run_pipeline(
     target_side_context: TargetSideContextFn | None = None,
     config_for_side: ConfigForSideFn | None = None,
     run_side: RunSideFn = run_one_release,
-    release_side: ReleaseSideFn = _release_comparison_side,
+    release_side: ReleaseSideFn = release_comparison_side,
     resolve_mode_fn: ResolveModeFn = resolve_mode,
 ) -> None:
     """Full pipeline (prepare + every phase's baseline/target + compare) for one mode."""
@@ -169,6 +175,7 @@ def create_comparison_app_and_run_ci(
     target_side_context: TargetSideContextFn | None = None,
     config_for_side: ConfigForSideFn | None = None,
     run_side: RunSideFn = run_one_release,
+    release_side: ReleaseSideFn = release_comparison_side,
     resolve_mode_fn: ResolveModeFn = resolve_mode,
 ) -> tuple[typer.Typer, Callable[[str | None], None]]:
     """Build, from one wiring, the manual typer app and a run_ci(mode) one-shot runner.
@@ -263,6 +270,7 @@ def create_comparison_app_and_run_ci(
             target_side_context=target_side_context,
             config_for_side=config_for_side,
             run_side=run_side,
+            release_side=release_side,
             resolve_mode_fn=resolve_mode_fn,
         )
 
@@ -295,6 +303,7 @@ def create_comparison_app_and_run_ci(
             target_side_context=target_side_context,
             config_for_side=config_for_side,
             run_side=run_side,
+            release_side=release_side,
             resolve_mode_fn=resolve_mode_fn,
         )
 
