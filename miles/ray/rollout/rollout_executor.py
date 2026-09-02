@@ -29,6 +29,7 @@ from miles.rollout.inference_rollout.compatibility import call_rollout_function,
 from miles.utils import object_store
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
 from miles.utils.audit_utils.event_logger import checkpoint as event_logger_checkpoint
+from miles.utils.audit_utils.event_logger.logger import maybe_event_logger_context
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.data import RolloutDataPack
 from miles.utils.environ import use_legacy_rollout_v1
@@ -172,9 +173,10 @@ class RolloutExecutor:
             metadata=metadata,
             trainer_model_id=trainer_model_id,
         )
-        log_rollout_data(
-            rollout_id, self.args, data, metrics, time.time() - start_time, trainer_model_id=trainer_model_id
-        )
+        with maybe_event_logger_context(dict(rollout_id=rollout_id)):
+            log_rollout_data(
+                rollout_id, self.args, data, metrics, time.time() - start_time, trainer_model_id=trainer_model_id
+            )
         data = convert_samples_to_train_data(
             self.args,
             data,
