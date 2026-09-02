@@ -1073,6 +1073,44 @@ class TestReconcile:
         asyncio.run(_attached(_controller(core_v1), pods).reconcile(_key(TRAINER_POOL_ID, 0)))
 
         assert core_v1.patched == []
+        assert core_v1.deleted == []
+
+    def test_deletes_an_inference_left_pinned_to_a_node_its_trainer_no_longer_runs_on(self):
+        """A released pod cannot be gated again, so only deleting it lets the workload recreate it paired."""
+        core_v1 = FakeCoreV1()
+        pods = [
+            _pod(INFERENCE_POOL_ID, 0, gated=False, node_name="gpu-3"),
+            _pod(TRAINER_POOL_ID, 0, node_name="gpu-9", gated=False),
+        ]
+
+        asyncio.run(_attached(_controller(core_v1), pods).reconcile(_key(TRAINER_POOL_ID, 0)))
+
+        assert core_v1.deleted == [_pod_name(INFERENCE_POOL_ID, 0)]
+        assert core_v1.patched == []
+
+    def test_keeps_an_inference_still_pinned_to_the_node_its_trainer_runs_on(self):
+        """Deleting a correctly paired engine would restart it on every reconcile of a healthy run."""
+        core_v1 = FakeCoreV1()
+        pods = [
+            _pod(INFERENCE_POOL_ID, 0, gated=False, node_name="gpu-3"),
+            _pod(TRAINER_POOL_ID, 0, node_name="gpu-3", gated=False),
+        ]
+
+        asyncio.run(_attached(_controller(core_v1), pods).reconcile(_key(TRAINER_POOL_ID, 0)))
+
+        assert core_v1.deleted == []
+
+    def test_waits_for_the_new_node_before_deleting_a_mispinned_inference(self):
+        """A trainer between nodes reports none, and deleting now would only make the engine restart twice."""
+        core_v1 = FakeCoreV1()
+        pods = [
+            _pod(INFERENCE_POOL_ID, 0, gated=False, node_name="gpu-3"),
+            _pod(TRAINER_POOL_ID, 0, gated=False),
+        ]
+
+        asyncio.run(_attached(_controller(core_v1), pods).reconcile(_key(TRAINER_POOL_ID, 0)))
+
+        assert core_v1.deleted == []
 
     def test_does_nothing_for_an_inference_that_disappeared(self):
         """A scaled-down release deletes pods, and their queued reconciles must not resurrect anything."""
@@ -1275,12 +1313,18 @@ class TestPairingConfig:
 class FakeCoreV1:
     def __init__(self, *, rejects: dict[str, int] | None = None) -> None:
         self.patched: list[tuple[str, list[dict[str, Any]]]] = []
+        self.deleted: list[str] = []
         self._rejects = rejects or {}
 
     async def patch_namespaced_pod(self, *, name: str, namespace: str, body: list[dict[str, Any]]) -> None:
         if (status := self._rejects.get(name)) is not None:
             raise client.ApiException(status=status, reason="rejected by the fake apiserver")
         self.patched.append((name, body))
+
+    async def delete_namespaced_pod(self, *, name: str, namespace: str) -> None:
+        if (status := self._rejects.get(name)) is not None:
+            raise client.ApiException(status=status, reason="rejected by the fake apiserver")
+        self.deleted.append(name)
 
 
 class PairingHarness:

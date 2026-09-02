@@ -223,11 +223,11 @@ class TestDisaggregatedRun:
 @requires_helm
 class TestPairingController:
     def test_holds_only_namespaced_rights_over_pods(self):
-        """Releasing a gate is an ordinary pod update, so nothing cluster-scoped is needed."""
+        """Releasing a gate and deleting a mispinned engine are both namespaced pod verbs."""
         role = named_object(render_run(*ENABLE), "Role", PAIRING)
 
         assert role["rules"] == [
-            {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch", "patch", "update"]}
+            {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch", "patch", "update", "delete"]}
         ]
 
     def test_never_asks_for_the_binding_subresource(self):

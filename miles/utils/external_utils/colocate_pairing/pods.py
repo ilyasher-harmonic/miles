@@ -66,6 +66,10 @@ def release_patch(
     ]
 
 
+def pinned_node_name(pod: Pod) -> str | None:
+    return pod.spec.node_name
+
+
 def gate_names(pod: Pod) -> list[str]:
     return [gate.name for gate in pod.spec.scheduling_gates]
 

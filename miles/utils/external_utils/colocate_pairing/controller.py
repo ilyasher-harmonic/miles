@@ -12,6 +12,7 @@ from miles.utils.external_utils.colocate_pairing.pods import (
     coordinate_of,
     gate_names,
     is_gated,
+    pinned_node_name,
     release_patch,
 )
 from miles.utils.workers.k8s_types import Pod
@@ -67,43 +68,49 @@ class PairingController:
         trainer_coord = next((coord for coord in pods_by_coord if coord.key == pair_key), None)
         if trainer_coord is None:
             return
-        gated_pods_and_base_gpu_ids = [
+        inference_pods_and_base_gpu_ids = [
             (pod, base_gpu_id)
             for inference_coord, base_gpu_id in self._inferences_of_trainer.get(trainer_coord, [])
-            if (pod := pods_by_coord.get(inference_coord)) is not None and is_gated(pod)
+            if (pod := pods_by_coord.get(inference_coord)) is not None
         ]
-        if not gated_pods_and_base_gpu_ids:
+        if not inference_pods_and_base_gpu_ids:
             return
 
         trainer_node_name = pods_by_coord[trainer_coord].spec.node_name
         if not trainer_node_name:
             logger.info(
-                "Waiting for %s to be scheduled before releasing %s",
+                "Waiting for %s to be scheduled before pairing %s",
                 trainer_coord.key,
-                [pod.metadata.name for pod, _ in gated_pods_and_base_gpu_ids],
+                [pod.metadata.name for pod, _ in inference_pods_and_base_gpu_ids],
             )
             return
 
         outcomes = await asyncio.gather(
             *(
-                self._release(
+                self._pair(
                     inference_pod,
                     node_name=trainer_node_name,
                     base_gpu_id=base_gpu_id,
                     trainer_key=trainer_coord.key,
                 )
-                for inference_pod, base_gpu_id in gated_pods_and_base_gpu_ids
+                for inference_pod, base_gpu_id in inference_pods_and_base_gpu_ids
             ),
             return_exceptions=True,
         )
-        for (inference_pod, _), outcome in zip(gated_pods_and_base_gpu_ids, outcomes, strict=True):
+        for (inference_pod, _), outcome in zip(inference_pods_and_base_gpu_ids, outcomes, strict=True):
             if isinstance(outcome, BaseException):
                 logger.error(
-                    "Releasing %s failed; the next reconcile of %s tries it again",
+                    "Pairing %s failed; the next reconcile of %s tries it again",
                     inference_pod.metadata.name,
                     trainer_coord.key,
                     exc_info=outcome,
                 )
+
+    async def _pair(self, inference_pod: Pod, *, node_name: str, base_gpu_id: int, trainer_key: str) -> None:
+        if is_gated(inference_pod):
+            await self._release(inference_pod, node_name=node_name, base_gpu_id=base_gpu_id, trainer_key=trainer_key)
+        elif (pinned := pinned_node_name(inference_pod)) is not None and pinned != node_name:
+            await self._evict(inference_pod, pinned=pinned, node_name=node_name, trainer_key=trainer_key)
 
     async def _release(self, inference_pod: Pod, *, node_name: str, base_gpu_id: int, trainer_key: str) -> None:
         logger.info(
@@ -123,6 +130,16 @@ class PairingController:
                 annotations=inference_pod.metadata.annotations,
             ),
         )
+
+    async def _evict(self, inference_pod: Pod, *, pinned: str, node_name: str, trainer_key: str) -> None:
+        logger.info(
+            "Deleting %s, pinned onto %s, so it is recreated gated and paired onto %s, where %s now runs",
+            inference_pod.metadata.name,
+            pinned,
+            node_name,
+            trainer_key,
+        )
+        await self._core_v1.delete_namespaced_pod(name=inference_pod.metadata.name, namespace=self._config.namespace)
 
     def key_of(self, pod: Pod) -> str:
         if (coord := coordinate_of(pod)) is not None and (key := self._trainer_key_of_coord.get(coord)) is not None:
