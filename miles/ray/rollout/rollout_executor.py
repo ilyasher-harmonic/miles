@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 import time
 from collections import defaultdict
@@ -17,6 +18,7 @@ from miles.ray.rollout.train_data_conversion import (
     split_train_data_by_dp,
 )
 from miles.rollout.base_types import (
+    BaseRolloutFn,
     RolloutFnConstructorInput,
     RolloutFnEvalInput,
     RolloutFnTrainInput,
@@ -130,14 +132,14 @@ class RolloutExecutor:
 
     async def dispose(self) -> None:
         if not self.use_legacy_rollout_v1 and self.generate_rollout is not None:
-            await self.generate_rollout.dispose()
+            await _dispose_rollout_fn(self.generate_rollout)
         if (close := getattr(self.data_source, "close", None)) is not None:
             close()
         event_analyzer.run_analysis_from_args(self.args)
         if self._metric_checker is not None:
             self._metric_checker.dispose()
         if isinstance(self.eval_generate_rollout, CheckpointEvalFn):
-            await self.eval_generate_rollout.dispose()
+            await _dispose_rollout_fn(self.eval_generate_rollout)
 
     # -------------------------- data generation -----------------------------
 
@@ -342,3 +344,8 @@ class RolloutExecutor:
         self._eval_fleet = RolloutExecutorEvalFleet(
             self.args, info=eval_fleet_info, inference_controller_provider=self._inference_controller_provider
         )
+
+
+async def _dispose_rollout_fn(rollout_fn: BaseRolloutFn) -> None:
+    if inspect.isawaitable(disposed := rollout_fn.dispose()):
+        await disposed
