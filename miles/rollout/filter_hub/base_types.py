@@ -32,12 +32,8 @@ class MetricGatherer:
         self._unfiltered_reward_count = 0
 
     def on_group_before_dynamic_filter(self, args: argparse.Namespace, group: list) -> None:
-        for sample in _iter_group_samples(group):
-            if sample.reward is None:
-                continue
-            if not args.reward_key and isinstance(sample.reward, dict):
-                continue
-            self._unfiltered_reward_sum += float(sample.get_reward_value(args))
+        for reward in iter_group_reward_values(args, group):
+            self._unfiltered_reward_sum += reward
             self._unfiltered_reward_count += 1
 
     def on_dynamic_filter_drop(self, reason: str | None):
@@ -53,6 +49,15 @@ class MetricGatherer:
         if self._unfiltered_reward_count:
             metrics["rollout/raw_reward_unfiltered"] = self._unfiltered_reward_sum / self._unfiltered_reward_count
         return metrics
+
+
+def iter_group_reward_values(args: argparse.Namespace, group: list) -> Iterator[float]:
+    for sample in _iter_group_samples(group):
+        if sample.reward is None:
+            continue
+        if not args.reward_key and isinstance(sample.reward, dict):
+            continue
+        yield float(sample.get_reward_value(args))
 
 
 def _iter_group_samples(group: list) -> Iterator[Sample]:

@@ -13,7 +13,7 @@ from typing import Any
 
 from miles.ray.multi_lora.controller import AdaptersCache, get_multi_lora_controller
 from miles.rollout.base_types import RolloutFnTrainOutput
-from miles.rollout.filter_hub.base_types import call_dynamic_filter
+from miles.rollout.filter_hub.base_types import call_dynamic_filter, iter_group_reward_values
 from miles.rollout.generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
 from miles.rollout.sglang_rollout import GenerateState, generate_and_rm_group, get_model_url
 from miles.utils.async_utils import run
@@ -167,6 +167,8 @@ class MultiLoRAWorkerMetrics:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.dynamic_filter_drop_counts: dict[str, int] = defaultdict(int)
+        self.raw_reward_sum = 0.0
+        self.raw_reward_count = 0
         # Staleness of dropped groups per adapter, drained every batch.
         self.staleness_values: dict[str, list[int]] = defaultdict(list)
         # Per-adapter shipped-sample values, flushed as step statistics when the adapter steps.
@@ -177,6 +179,13 @@ class MultiLoRAWorkerMetrics:
         # Group outcomes for zero-std rates: shipped group counts and each uniform-reward group's reward.
         self.step_group_counts: dict[str, int] = defaultdict(int)
         self.step_zero_std_rewards: dict[str, list[float]] = defaultdict(list)
+
+    def record_raw_rewards(self, args, group: Group) -> None:
+        rewards = list(iter_group_reward_values(args, group))
+        reward_sum = sum(rewards)
+        with self.lock:
+            self.raw_reward_sum += reward_sum
+            self.raw_reward_count += len(rewards)
 
     def record_dynamic_filter_drop(self, reason: str) -> None:
         with self.lock:
@@ -263,6 +272,10 @@ class MultiLoRAWorkerMetrics:
                 for reason, count in self.dynamic_filter_drop_counts.items()
             }
             self.dynamic_filter_drop_counts.clear()
+            if self.raw_reward_count:
+                metrics["rollout/raw_reward_unfiltered"] = self.raw_reward_sum / self.raw_reward_count
+            self.raw_reward_sum = 0.0
+            self.raw_reward_count = 0
             return metrics
 
 
@@ -359,6 +372,7 @@ class AsyncMultiLoRAWorker:
         if result is None:
             return
 
+        self.metrics.record_raw_rewards(self.args, result)
         filter_result = call_dynamic_filter(self.dynamic_filter, self.args, result)
         if not filter_result.keep:
             if filter_result.reason:
