@@ -386,7 +386,7 @@ class TestBuildLoraSyncConfigUnderMultiLora:
 
 
 class TestSaveLoraCheckpointTrainingState:
-    def _save(self, tmp_path, monkeypatch, *, no_save_optim):
+    def _save(self, tmp_path, monkeypatch, *, no_save_optim, scheduler=None):
         rank0 = SimpleNamespace(rank=0)
         monkeypatch.setattr(
             lora_utils, "get_parallel_state", lambda: SimpleNamespace(effective_dp=rank0, cp=rank0, tp=rank0, pp=rank0)
@@ -409,14 +409,64 @@ class TestSaveLoraCheckpointTrainingState:
             no_save_optim=no_save_optim,
         )
         optimizer = SimpleNamespace(state_dict=lambda: {"step": 7})
-        save_lora_checkpoint(model, args, str(tmp_path), optimizer=optimizer, opt_param_scheduler=None, iteration=3)
+        save_lora_checkpoint(
+            model, args, str(tmp_path), optimizer=optimizer, opt_param_scheduler=scheduler, iteration=3
+        )
         return sorted(path.name for path in tmp_path.iterdir())
 
-    def test_training_state_is_written_by_default(self, tmp_path, monkeypatch):
-        files = self._save(tmp_path, monkeypatch, no_save_optim=False)
-        assert files == ["adapter_megatron_rank0.pt", "training_state_rank0.pt"]
-        state = torch.load(tmp_path / "training_state_rank0.pt", weights_only=False)
-        assert state["optimizer"] == {"step": 7} and state["iteration"] == 3
+    @staticmethod
+    def _state(tmp_path):
+        return torch.load(tmp_path / "training_state_rank0.pt", weights_only=False)
 
-    def test_no_save_optim_keeps_only_the_adapter(self, tmp_path, monkeypatch):
-        assert self._save(tmp_path, monkeypatch, no_save_optim=True) == ["adapter_megatron_rank0.pt"]
+    def test_training_state_is_written_by_default(self, tmp_path, monkeypatch):
+        scheduler = SimpleNamespace(state_dict=lambda: {"lr": 0.5})
+        files = self._save(tmp_path, monkeypatch, no_save_optim=False, scheduler=scheduler)
+
+        assert files == ["adapter_megatron_rank0.pt", "training_state_rank0.pt"]
+        state = self._state(tmp_path)
+        assert state["optimizer"] == {"step": 7}
+        assert state["opt_param_scheduler"] == {"lr": 0.5}
+        assert state["iteration"] == 3
+
+    def test_no_save_optim_drops_the_optimizer_and_keeps_the_resume_metadata(self, tmp_path, monkeypatch):
+        """--no-save-optim is about optimizer state; losing the step and the LR schedule with it
+        would silently restart a resumed run from iteration 0."""
+        scheduler = SimpleNamespace(state_dict=lambda: {"lr": 0.5})
+        files = self._save(tmp_path, monkeypatch, no_save_optim=True, scheduler=scheduler)
+
+        assert files == ["adapter_megatron_rank0.pt", "training_state_rank0.pt"]
+        state = self._state(tmp_path)
+        assert state["optimizer"] is None
+        assert state["opt_param_scheduler"] == {"lr": 0.5}
+        assert state["iteration"] == 3
+
+
+class TestLoadTrainingState:
+    @staticmethod
+    def _recorder():
+        loaded = []
+        return loaded, SimpleNamespace(load_state_dict=loaded.append)
+
+    def _write(self, tmp_path, optimizer_state):
+        torch.save(
+            {"iteration": 3, "optimizer": optimizer_state, "opt_param_scheduler": {"lr": 0.5}},
+            tmp_path / "training_state_rank0.pt",
+        )
+
+    def test_an_optimizer_free_checkpoint_still_restores_the_step_and_the_schedule(self, tmp_path):
+        self._write(tmp_path, None)
+        optimizer_loads, optimizer = self._recorder()
+        scheduler_loads, scheduler = self._recorder()
+
+        assert lora_utils._load_training_state(tmp_path, optimizer, scheduler) == 3
+        assert optimizer_loads == []
+        assert scheduler_loads == [{"lr": 0.5}]
+
+    def test_a_full_checkpoint_restores_the_optimizer(self, tmp_path):
+        self._write(tmp_path, {"step": 7})
+        optimizer_loads, optimizer = self._recorder()
+        scheduler_loads, scheduler = self._recorder()
+
+        assert lora_utils._load_training_state(tmp_path, optimizer, scheduler) == 3
+        assert optimizer_loads == [{"step": 7}]
+        assert scheduler_loads == [{"lr": 0.5}]
