@@ -1,258 +1,254 @@
 import asyncio
 import dataclasses
-import functools
 import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-import ray
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 
-from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient, wait_server_healthy
-from miles.backends.sglang_utils.sglang_config import ServerGroupConfig
-from miles.backends.sglang_utils.sglang_engine import build_server_url, compute_api_key, format_v6_uri
+from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient, probe_server_healthy
+from miles.backends.sglang_utils.sglang_engine import build_server_url
 from miles.backends.sglang_utils.sglang_router_api_client import SGLangRouterApiClient, use_legacy_router_api
 from miles.ray.rollout.cell_state import (
-    AddrInfo,
+    CellAddrInfo,
     CellState,
-    StateAllocatedAlive,
-    StateAllocatedBase,
-    StateAllocatedUninitialized,
-    StateStopped,
+    StateDisposed,
+    StateInitializing,
+    StatePendingWeights,
+    StateServing,
+    StateUninitialized,
 )
-from miles.ray.specs.inference import _compute_spec_inference_engine
-from miles.utils.workers.addr_allocator import PortAllocator
-from miles.utils.workers.command_actor import CommandActor
-from miles.utils.workers.worker_spec import HostAndPort, LaunchCommandContext
+from miles.utils.ft_utils.api_server.models import CellCondition, CellStatus, TriState
+from miles.utils.ft_utils.health_checker import (
+    ActiveAndEpoch,
+    BaseHealthChecker,
+    NoopHealthChecker,
+    SimpleHealthChecker,
+    SimpleHealthCheckerConfig,
+)
+from miles.utils.pydantic_utils import FrozenStrictBaseModel
+from miles.utils.workers.launch_gate import GATE_PORT_NAME, activate_launch_gate
+from miles.utils.workers.worker_provider.base import BaseWorkerProvider
+from miles.utils.workers.worker_provider.ray import RayWorkerProvider
 
 logger = logging.getLogger(__name__)
 
 SHUTDOWN_TIMEOUT = 30
+INITIALIZING_TIMEOUT_SECONDS = 1800.0
+
+
+class ServerCellMetadata(FrozenStrictBaseModel):
+    model_id: str
+    worker_type: Literal["regular", "prefill", "decode"]
+    cell_id: str
+    num_gpus_per_engine: int
+    gpu_offset: int
+    sglang_api_key: str | None
+    worker_name: str
+    needs_offload: bool
+    update_weights: bool
+    workers_hash: str
 
 
 @dataclass
 class ServerCell:
     args: Any
-    worker_type: Literal["regular", "prefill", "decode"]
-    cell_id: str
-    num_nodes: int = 1
-    pg: Any = None  # (placement_group, reordered_bundle_indices, reordered_gpu_ids)
-    num_gpus_per_engine: int = 1
-    rank_offset: int = 0
-    gpu_offset: int = 0
-    sglang_overrides: dict = dataclasses.field(default_factory=dict)
-    model_idx: int = 0
-    server_group_config: ServerGroupConfig | None = None
-    cell_index: int = 0
-    needs_offload: bool = False
-    model_path: str | None = None
-    update_weights: bool = True
-    _state: CellState = dataclasses.field(default_factory=StateStopped)
+    meta: ServerCellMetadata
+    router_api_client: SGLangRouterApiClient
+    global_health_checker_activeness: Callable[[], ActiveAndEpoch] = lambda: ActiveAndEpoch(active=True, epoch=0)
+    _health_checker: BaseHealthChecker = dataclasses.field(init=False)
+    _state: CellState = dataclasses.field(default_factory=StateUninitialized)
+
+    def __post_init__(self) -> None:
+        self._health_checker = create_rollout_cell_health_checker(
+            args=self.args,
+            name=f"rollout-cell-{self.meta.cell_id}",
+            get_api_client=lambda: self.api_client,
+            get_activeness=self._get_health_checker_active_and_epoch,
+        )
+        self._health_checker.start()
+
+    def _get_health_checker_active_and_epoch(self) -> ActiveAndEpoch:
+        controller_active_and_epoch = self.global_health_checker_activeness()
+        cell_active = isinstance(self._state, (StatePendingWeights, StateServing))
+        return ActiveAndEpoch(
+            active=cell_active and controller_active_and_epoch.active, epoch=controller_active_and_epoch.epoch
+        )
+
+    def __del__(self) -> None:
+        assert isinstance(self._state, StateDisposed), (
+            f"ServerCell {self.meta.cell_id} was garbage collected without dispose() ({self._state=}); "
+            "every cell must be disposed so its health checker task is stopped"
+        )
+
+    def cell_status(self) -> CellStatus:
+        match self._state:
+            case StateUninitialized() | StateInitializing():
+                return compute_pending_rollout_cell_status(
+                    past_startup_deadline=self.is_initializing_past_deadline, workers_hash=self.meta.workers_hash
+                )
+
+            case StatePendingWeights() | StateServing():
+                return CellStatus(
+                    phase="Running",
+                    conditions=[
+                        CellCondition.allocated(TriState.TRUE),
+                        CellCondition.from_health_checker_status(self._health_checker.status),
+                        CellCondition.serving(TriState.TRUE if self.is_serving else TriState.FALSE),
+                    ],
+                    workers_hash=self.meta.workers_hash,
+                )
+
+            case StateDisposed():
+                return CellStatus(
+                    phase="Suspended",
+                    conditions=[CellCondition.allocated(TriState.FALSE)],
+                    workers_hash=self.meta.workers_hash,
+                )
+
+            case _:
+                raise NotImplementedError(f"Unknown state: {self._state}")
 
     @property
-    def is_allocated(self) -> bool:
-        return isinstance(self._state, StateAllocatedBase)
+    def is_uninitialized(self) -> bool:
+        return isinstance(self._state, StateUninitialized)
 
     @property
-    def is_alive(self) -> bool:
-        return isinstance(self._state, StateAllocatedAlive)
+    def is_initializing(self) -> bool:
+        return isinstance(self._state, StateInitializing)
 
     @property
-    def actor_handles(self) -> list[ray.actor.ActorHandle]:
-        assert isinstance(self._state, StateAllocatedBase)
-        return self._state.actor_handles
+    def is_pending_weights_or_serving(self) -> bool:
+        return isinstance(self._state, (StatePendingWeights, StateServing))
 
     @property
-    def primary_actor_handle(self) -> ray.actor.ActorHandle:
-        return self.actor_handles[0]
+    def is_pending_weights(self) -> bool:
+        return isinstance(self._state, StatePendingWeights)
 
     @property
-    def engine_gpu_ids(self) -> list[list[int]]:
-        _, _, reordered_gpu_ids = self.pg
-        gpus_on_node = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
-        bases = [
-            int(reordered_gpu_ids[self.gpu_offset + local_index * gpus_on_node])
-            for local_index in range(self.num_nodes)
-        ]
-        return [list(range(base, base + gpus_on_node)) for base in bases]
+    def is_serving(self) -> bool:
+        return isinstance(self._state, StateServing)
 
     @property
-    def addr_infos(self) -> list[AddrInfo]:
-        assert isinstance(self._state, StateAllocatedBase)
-        assert self._state.addr_infos is not None, f"{self._state=}"
-        return self._state.addr_infos
+    def is_initializing_past_deadline(self) -> bool:
+        return self.is_initializing and time.monotonic() - self._state.start_time >= INITIALIZING_TIMEOUT_SECONDS
 
     @property
-    def addr_info(self) -> AddrInfo:
-        return self.addr_infos[0]
+    def addr_info(self) -> CellAddrInfo:
+        assert isinstance(self._state, (StateInitializing, StatePendingWeights, StateServing))
+        return self._state.addr_info
+
+    @property
+    def server_url(self) -> str:
+        return self.addr_info.server_url
 
     @property
     def api_client(self) -> SGLangApiClient:
-        return SGLangApiClient(server_url=self.addr_info.server_url)
+        return SGLangApiClient(server_url=self.server_url)
 
-    async def start_engines(self, port_allocator: PortAllocator) -> None:
-        assert not ({"host", "port"} & set(self.sglang_overrides)), (
-            f"sglang_overrides must not override host/port ({self.sglang_overrides=}): the rollout process derives "
-            f"each engine's url from the addr allocator, so an override would make it talk to the wrong endpoint"
-        )
-        assert not self.is_allocated, "the caller starts only stopped cells"
-
+    async def init(self) -> None:
         if self.args.rollout_external:
             raise NotImplementedError(
                 "external rollout address allocation was removed and a new implementation is coming"
             )
 
-        num_gpu_per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
-
-        spec = _compute_spec_inference_engine(
-            self.args,
-            model_idx=self.model_idx,
-            server_group_config=self.server_group_config,
-        )
-
-        actor_handles = [
-            launch_sglang_ray_actor(
-                env_vars=spec.env_var(),
-                pg=self.pg,
-                gpu_index=self.gpu_offset + local_index * num_gpu_per_engine,
-            )
-            for local_index in range(self.num_nodes)
-        ]
-
-        self._mark_allocated_uninitialized(actor_handles)
-
-        global_ranks = [self.rank_offset + local_index for local_index in range(self.num_nodes)]
-
-        node_ips = list(await asyncio.gather(*[actor._get_node_ip.remote() for actor in actor_handles]))
-
-        addr_and_ports: dict[int, dict[str, Any]] = {}
-        dist_init = None
-        for local_index, (rank, actor) in enumerate(zip(global_ranks, actor_handles, strict=True)):
-            node_ip = node_ips[local_index]
-            alloc = functools.partial(port_allocator.alloc, actor, node_ip=node_ip)
-
-            if local_index == 0:
-                dist_init = HostAndPort(
-                    host=format_v6_uri(node_ip), port=alloc(consecutive=30 + self.args.sglang_dp_size)
-                )
-
-            addr_and_ports[rank] = dict(
-                host=format_v6_uri(node_ip),
-                port=alloc(),
-                nccl_port=alloc(),
-                engine_info_bootstrap_port=alloc(),
-                dist_init=dist_init,
-            )
-            if self.worker_type == "prefill":
-                addr_and_ports[rank]["disaggregation_bootstrap_port"] = alloc()
-
-        self._mark_addressing(
-            [
-                AddrInfo(
-                    server_url=build_server_url(
-                        host=addr_and_ports[global_rank]["host"], port=addr_and_ports[global_rank]["port"]
-                    ),
-                    bootstrap_port=addr_and_ports[global_rank].get("disaggregation_bootstrap_port"),
-                )
-                for global_rank in global_ranks
-            ]
-        )
-
-        if env_report := self.args.env_report:
-            await asyncio.gather(
-                *[
-                    actor._collect_env_report.remote(role="rollout", rank=rank, partial_env_report=env_report)
-                    for rank, actor in zip(global_ranks, actor_handles, strict=True)
-                ]
-            )
-
-        launch_cmds = {
-            rank: spec.launch_command(
-                LaunchCommandContext(
-                    cell_index=self.cell_index,
-                    worker_in_cell_index=local_index,
-                    self_addrs=_compute_self_addrs(addr_and_ports[rank]),
-                    spec_addrs={},
-                    gpu_ids=self.engine_gpu_ids[local_index],
-                )
-            )
-            for local_index, rank in enumerate(global_ranks)
-        }
-
-        await asyncio.gather(
-            *[
-                actor.run.remote(cmd=launch_cmds[global_rank], envs={})
-                for global_rank, actor in zip(global_ranks, actor_handles, strict=True)
-            ]
-        )
-
-        await wait_server_healthy(
-            server_url=self.addr_info.server_url,
-            api_key=compute_api_key(self.args, sglang_overrides=self.sglang_overrides),
-            is_process_alive=functools.partial(_engine_actor_is_alive, self.primary_actor_handle),
-        )
-
-    async def start(
-        self, port_allocator: PortAllocator, router_api_client: SGLangRouterApiClient, recover: bool = False
-    ) -> None:
-        await self.start_engines(port_allocator)
-
-        if recover and self.needs_offload:
-            await self.api_client.release_memory_occupation()
-            if self.update_weights or self.model_path:
-                await self.api_client.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
-
-        self._mark_alive()
-
-        await self.register(router_api_client)
-
-    async def stop(self, router_api_client: SGLangRouterApiClient) -> None:
-        if self.is_allocated:
-            try:
-                await asyncio.wait_for(self.unregister(router_api_client), timeout=SHUTDOWN_TIMEOUT)
-            except Exception as e:
-                logger.warning(f"Unregistering cell {self.cell_id} from the router failed, tearing down anyway ({e})")
-
-            for local_index, actor_handle in enumerate(self.actor_handles):
-                logger.info(f"Cell {self.cell_id}: shutting down and killing engine at cell-local index {local_index}")
-                try:
-                    ray.get(actor_handle.shutdown.remote(), timeout=SHUTDOWN_TIMEOUT)
-                except Exception as e:
-                    logger.warning(
-                        f"Cell {self.cell_id}: graceful shutdown of engine at cell-local index {local_index} "
-                        f"failed, killing anyway ({e})"
-                    )
-                try:
-                    ray.kill(actor_handle)
-                    logger.info(f"Cell {self.cell_id}: killed engine at cell-local index {local_index}")
-                except Exception as e:
-                    logger.warning(f"Cell {self.cell_id}: fail to kill engine at cell-local index {local_index} ({e})")
-        else:
-            logger.info(f"Cell {self.cell_id} is already stopped")
-        self._mark_stopped()
-
-    def _mark_allocated_uninitialized(self, actor_handles: list[ray.actor.ActorHandle]) -> None:
+        addr_info = await self._compute_addr_info()
+        await activate_launch_gate(gate_url=addr_info.gate_url)
         self._change_state(
-            "mark_allocated_uninitialized", StateStopped, StateAllocatedUninitialized(actor_handles=actor_handles)
+            "init", StateUninitialized, StateInitializing(addr_info=addr_info, start_time=time.monotonic())
         )
 
-    def _mark_addressing(self, addr_infos: list[AddrInfo]) -> None:
+    async def tick(self) -> None:
+        if isinstance(self._state, StateInitializing):
+            await self._tick_when_initializing()
+
+    async def _tick_when_initializing(self) -> None:
+        addr_info = self._state.addr_info
+        if not await probe_server_healthy(server_url=addr_info.server_url, api_key=self.meta.sglang_api_key):
+            return
+
+        if self.args.check_weight_update_equal and self.meta.update_weights:
+            await self.check_weights(action="snapshot", allow_quant_error=False, selector="all", skip_list=None)
+
+        if self.meta.needs_offload:
+            api_client = SGLangApiClient(server_url=addr_info.server_url)
+            await api_client.release_memory_occupation()
+            await api_client.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+
+        serve_without_weight_update: bool = not self.meta.update_weights or self.args.debug_rollout_only
+        if not serve_without_weight_update and self.args.check_weight_update_equal:
+            await self.check_weights(
+                action="reset_tensors",
+                allow_quant_error=False,
+                selector="all",
+                skip_list=self.args.check_weight_update_skip_list,
+            )
+
+        if serve_without_weight_update:
+            await self._register_with_router(addr_info=addr_info)
+
+        self._change_state("mark_pending_weights", StateInitializing, StatePendingWeights(addr_info=addr_info))
+
+        if serve_without_weight_update:
+            self._mark_serving()
+
+    async def mark_weights_ready(self) -> None:
+        assert isinstance(self._state, StatePendingWeights), f"{self._state=}"
+        await self._register_with_router(addr_info=self._state.addr_info)
+        self._mark_serving()
+
+    async def _register_with_router(self, addr_info: CellAddrInfo) -> None:
+        await self.router_api_client.add_worker(
+            worker_url=addr_info.server_url,
+            worker_type=self.meta.worker_type,
+            use_legacy_api=use_legacy_router_api(self.args),
+            bootstrap_port=addr_info.bootstrap_port,
+        )
+
+    async def dispose(self) -> None:
+        self._health_checker.stop()
+
+        match self._state:
+            case StateServing():
+                await self._unregister_from_router()
+            case StateUninitialized() | StateInitializing() | StatePendingWeights() | StateDisposed():
+                pass
+            case _:
+                raise ValueError(f"{self._state=}")
+
         self._change_state(
-            "mark_addressing",
-            StateAllocatedUninitialized,
-            StateAllocatedUninitialized(actor_handles=self.actor_handles, addr_infos=addr_infos),
+            "dispose",
+            (StateUninitialized, StateInitializing, StatePendingWeights, StateServing, StateDisposed),
+            StateDisposed(),
         )
 
-    def _mark_alive(self) -> None:
-        self._change_state(
-            "mark_alive",
-            StateAllocatedUninitialized,
-            StateAllocatedAlive(actor_handles=self.actor_handles, addr_infos=self.addr_infos),
+    async def _unregister_from_router(self) -> None:
+        try:
+            await asyncio.wait_for(
+                self.router_api_client.remove_worker(
+                    worker_url=self.server_url,
+                    use_legacy_api=use_legacy_router_api(self.args),
+                ),
+                timeout=SHUTDOWN_TIMEOUT,
+            )
+        except Exception as e:
+            logger.warning(f"Unregistering cell {self.meta.cell_id} from the router failed, tearing down anyway ({e})")
+
+    async def _compute_addr_info(self) -> CellAddrInfo:
+        provider: BaseWorkerProvider = RayWorkerProvider.create()  # TODO inject instance
+        master_addrs = await provider.get_addrs(worker_name=self.meta.worker_name)
+        primary = master_addrs["primary"]
+        gate = master_addrs[GATE_PORT_NAME]
+        return CellAddrInfo(
+            server_url=build_server_url(host=primary.host, port=primary.port),
+            bootstrap_port=x.port if (x := master_addrs.get("disaggregation_bootstrap")) else None,
+            gate_url=build_server_url(host=gate.host, port=gate.port),
         )
 
-    def _mark_stopped(self) -> None:
-        self._change_state("mark_stopped", (StateStopped, StateAllocatedBase), StateStopped())
+    def _mark_serving(self) -> None:
+        self._change_state("mark_serving", StatePendingWeights, StateServing(addr_info=self.addr_info))
 
     # TODO: unify w/ trainer `change_state`
     def _change_state(
@@ -261,24 +257,10 @@ class ServerCell:
         old_state_cls: type[CellState] | tuple[type[CellState], ...],
         new_state: CellState,
     ) -> None:
-        logger.info(f"Cell {self.cell_id} {debug_name} start old={self._state}")
+        logger.info(f"Cell {self.meta.cell_id} {debug_name} start old={self._state}")
         assert isinstance(self._state, old_state_cls), f"{self._state=}"
         self._state = new_state
-        logger.info(f"Cell {self.cell_id} {debug_name} end new={self._state}")
-
-    async def probe_and_mark_dead(self) -> None:
-        if not self.is_allocated:
-            return
-        try:
-            await asyncio.wait_for(self.primary_actor_handle.get_weight_version.remote(), timeout=60)
-        except Exception as e:
-            logger.warning(f"Cell unreachable ({e!r}); marking stopped for recovery")
-            for actor_handle in self.actor_handles:
-                try:
-                    ray.kill(actor_handle)
-                except Exception:
-                    pass
-            self._mark_stopped()
+        logger.info(f"Cell {self.meta.cell_id} {debug_name} end new={self._state}")
 
     async def offload(self, tags: list[str] | None):
         return await self.api_client.release_memory_occupation(tags=tags)
@@ -291,73 +273,39 @@ class ServerCell:
             action=action, allow_quant_error=allow_quant_error, selector=selector, skip_list=skip_list
         )
 
-    async def register(self, router_api_client: SGLangRouterApiClient) -> None:
-        await router_api_client.add_worker(
-            worker_url=self.addr_info.server_url,
-            worker_type=self.worker_type,
-            use_legacy_api=use_legacy_router_api(self.args),
-            bootstrap_port=self.addr_info.bootstrap_port,
-        )
-
-    async def unregister(self, router_api_client: SGLangRouterApiClient) -> None:
-        await router_api_client.remove_worker(
-            worker_url=self.addr_info.server_url,
-            use_legacy_api=use_legacy_router_api(self.args),
-        )
-
-
-# TODO: will be removed
-def _compute_self_addrs(addr_and_ports_of_rank: dict[str, Any]) -> dict[str, HostAndPort]:
-    host = addr_and_ports_of_rank["host"]
-
-    port_by_name = dict(
-        primary=addr_and_ports_of_rank["port"],
-        nccl=addr_and_ports_of_rank["nccl_port"],
-        engine_info_bootstrap=addr_and_ports_of_rank["engine_info_bootstrap_port"],
-    )
-    if "disaggregation_bootstrap_port" in addr_and_ports_of_rank:
-        port_by_name["disaggregation_bootstrap"] = addr_and_ports_of_rank["disaggregation_bootstrap_port"]
-
-    self_addrs = {name: HostAndPort(host=host, port=port) for name, port in port_by_name.items()}
-    self_addrs["dist_init"] = addr_and_ports_of_rank["dist_init"]
-    return self_addrs
-
 
 def compute_nodes_per_engine(*, num_gpus_per_engine: int, num_gpus_per_node: int) -> int:
     return max(1, num_gpus_per_engine // num_gpus_per_node)
 
 
-def launch_sglang_ray_actor(
+def create_rollout_cell_health_checker(
     *,
-    env_vars: dict[str, str],
-    pg: Any,
-    gpu_index: int,
-) -> ray.actor.ActorHandle:
-    pg, reordered_bundle_indices, _ = pg
+    args: Any,
+    name: str,
+    get_api_client: Callable[[], SGLangApiClient],
+    get_activeness: Callable[[], ActiveAndEpoch],
+) -> BaseHealthChecker:
+    if "rollout" not in args.ft_components:
+        return NoopHealthChecker()
 
-    num_gpus = 0.2
-    num_cpus = num_gpus
+    config = SimpleHealthCheckerConfig.from_args(args, prefix="rollout_health_check")
 
-    scheduling_strategy = PlacementGroupSchedulingStrategy(
-        placement_group=pg,
-        placement_group_capture_child_tasks=True,
-        placement_group_bundle_index=reordered_bundle_indices[gpu_index],
+    async def _check() -> None:
+        await get_api_client().health_generate(timeout=config.timeout)
+
+    return SimpleHealthChecker(name=name, check_fn=_check, get_activeness=get_activeness, config=config)
+
+
+def compute_pending_rollout_cell_status(*, workers_hash: str, past_startup_deadline: bool = False) -> CellStatus:
+    return CellStatus(
+        phase="Pending",
+        conditions=[
+            CellCondition.allocated(TriState.TRUE),
+            *(
+                [CellCondition.healthy(TriState.FALSE, reason="StartupDeadlineExceeded")]
+                if past_startup_deadline
+                else []
+            ),
+        ],
+        workers_hash=workers_hash,
     )
-
-    RolloutRayActor = ray.remote(CommandActor)
-    return RolloutRayActor.options(
-        num_cpus=num_cpus,
-        num_gpus=num_gpus,
-        scheduling_strategy=scheduling_strategy,
-        runtime_env={
-            "env_vars": env_vars,
-        },
-    ).remote()
-
-
-def _engine_actor_is_alive(actor_handle: ray.actor.ActorHandle) -> bool:
-    try:
-        ray.get(actor_handle._get_node_ip.remote(), timeout=30)
-        return True
-    except Exception:
-        return False

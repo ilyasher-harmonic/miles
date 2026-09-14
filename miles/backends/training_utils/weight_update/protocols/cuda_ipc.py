@@ -73,7 +73,6 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
         for distributed. Map ranks to colocated IPC engines.
         """
         self.rollout_engines = rollout_engines
-        self._connection_stale = False
         self._selector = selector
 
         if engine_gpu_counts is None:
@@ -188,6 +187,10 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
                 futures = (futures or []) + futures_distributed
         check_weight_sync_results(async_utils.wait_futures(futures or []), is_lora=False)
         del long_lived_tensors
+
+    def after_engines_resumed(self) -> None:
+        torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
 
 
 def _send_to_colocated_engine(

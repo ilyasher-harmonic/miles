@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import textwrap
 from argparse import ArgumentParser, Namespace
+from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -11,18 +12,6 @@ from sglang_router.launch_router import RouterArgs
 
 from miles.utils import object_store
 from miles.utils.types import Sample
-
-
-def fake_actor_handle() -> MagicMock:
-    """MagicMock that passes ``isinstance(x, ray.actor.ActorHandle)``.
-
-    Setting ``_spec_class`` directly (rather than ``spec=...``) keeps
-    arbitrary-attribute auto-creation working so ``actor.shutdown.remote(...)``
-    chains still resolve — ``ActorHandle`` routes its methods via
-    ``__getattr__`` and they don't show up as class attributes."""
-    m = MagicMock()
-    m._spec_class = ray.actor.ActorHandle
-    return m
 
 
 def make_args(**overrides: Any) -> Namespace:
@@ -47,6 +36,9 @@ def make_args(**overrides: Any) -> Namespace:
         over_sampling_batch_size=None,
         rollout_global_dataset=False,
         num_rollout=1,
+        update_weights_interval=1,
+        check_weight_update_equal=False,
+        check_weight_update_skip_list=None,
         # batch / training
         global_batch_size=8,
         use_dynamic_global_batch_size=False,
@@ -65,6 +57,7 @@ def make_args(**overrides: Any) -> Namespace:
         reward_key=None,
         log_reward_category=None,
         log_passrate=False,
+        pin_rollout_manager_to_head=False,
         # placement / colocation
         debug_train_only=False,
         debug_rollout_only=False,
@@ -72,6 +65,18 @@ def make_args(**overrides: Any) -> Namespace:
         colocate=False,
         actor_num_nodes=1,
         actor_num_gpus_per_node=8,
+        indep_dp=False,
+        train_backend="megatron",
+        kl_coef=0,
+        use_kl_loss=False,
+        use_opd=False,
+        opd_type="megatron",
+        train_env_vars={},
+        dumper_source_patcher_config_train=None,
+        offload_train=False,
+        offload_train_target="cpu",
+        offload_train_disk_dir="/tmp/offload",
+        offload_train_disk_chunk_mb=64,
         critic_num_nodes=0,
         critic_num_gpus_per_node=0,
         use_critic=False,
@@ -84,6 +89,9 @@ def make_args(**overrides: Any) -> Namespace:
         sglang_dp_size=1,
         sglang_pp_size=1,
         sglang_ep_size=1,
+        sglang_api_key=None,
+        multi_lora_n_adapters=0,
+        target_modules=None,
         sglang_speculative_algorithm=None,
         sglang_config=None,
         sglang_model_routers=None,
@@ -91,11 +99,15 @@ def make_args(**overrides: Any) -> Namespace:
         # routers / session server
         use_miles_dashboard=False,
         use_miles_router=False,
+        miles_router_timeout=None,
+        miles_router_max_connections=None,
+        miles_router_health_check_failure_threshold=3,
+        sglang_server_concurrency=512,
         use_session_server=False,
         use_rollout_routing_replay=False,
         session_server_ip=None,
         session_server_port=None,
-        session_server_workers=32,
+        session_server_workers=1,
         run_uuid="0123456789abcdef",
         # external rollout
         rollout_external=False,
@@ -104,8 +116,10 @@ def make_args(**overrides: Any) -> Namespace:
         offload_rollout=False,
         use_fault_tolerance=False,
         ft_components=[],
-        rollout_health_check_interval=10.0,
+        rollout_health_check_interval=30.0,
         rollout_health_check_timeout=30.0,
+        rollout_health_check_first_wait=0.0,
+        rollout_health_check_failure_threshold=1,
         # engine launch command
         seed=42,
         fp16=False,
@@ -114,7 +128,6 @@ def make_args(**overrides: Any) -> Namespace:
         # checkpoint / data source
         hf_checkpoint="/fake/model",
         lora_rank=0,
-        lora_adapter_path=None,
         rollout_function_path="miles.rollout.sglang_rollout.generate_rollout",
         eval_function_path="miles.rollout.sglang_rollout.eval_generate_rollout",
         data_source_path="miles.data.dummy.DummyDataSource",
@@ -224,6 +237,27 @@ def make_sglang_config_yaml(
     return "\n".join(lines) + "\n"
 
 
+# --------------------------- server cell fixtures ---------------------------
+
+_tracked_server_cells: list[Any] = []
+
+
+def track_server_cell(cell: Any) -> Any:
+    """Register a cell for teardown. ``ServerCell.__del__`` asserts that every cell was disposed."""
+    _tracked_server_cells.append(cell)
+    return cell
+
+
+@pytest.fixture
+async def dispose_tracked_server_cells() -> AsyncIterator[None]:
+    """Dispose every cell registered through ``track_server_cell`` during the test."""
+    _tracked_server_cells.clear()
+    yield
+    for cell in _tracked_server_cells:
+        await cell.dispose()
+    _tracked_server_cells.clear()
+
+
 # --------------------------- ray fixtures ---------------------------
 
 
@@ -291,33 +325,6 @@ def dedent(s: str) -> str:
     return textwrap.dedent(s).lstrip("\n")
 
 
-def make_dataclass_cells(
-    *,
-    num_cells: int = 2,
-    num_gpus_per_engine: int = 1,
-    gpu_offset: int = 0,
-):
-    """Build configured ``ServerCell``s with ``pg=None`` (no actor scheduling).
-    Each cell starts unallocated."""
-    from miles.ray.rollout.server_cell import ServerCell, compute_nodes_per_engine
-
-    args = make_args(num_gpus_per_node=8)
-    nodes_per_engine = compute_nodes_per_engine(num_gpus_per_engine=num_gpus_per_engine, num_gpus_per_node=8)
-    return [
-        ServerCell(
-            args=args,
-            worker_type="regular",
-            cell_id=f"cell-{cell_index}",
-            num_nodes=nodes_per_engine,
-            pg=None,
-            num_gpus_per_engine=num_gpus_per_engine,
-            rank_offset=cell_index * nodes_per_engine,
-            gpu_offset=gpu_offset + cell_index * min(num_gpus_per_engine, 8),
-        )
-        for cell_index in range(num_cells)
-    ]
-
-
 def fake_engine(host: str = "10.0.0.1", port_seed: int = 30000) -> MagicMock:
     """MagicMock that mimics the engine ``CommandActor`` enough for ``addr_allocator``.
 
@@ -331,7 +338,7 @@ def fake_engine(host: str = "10.0.0.1", port_seed: int = 30000) -> MagicMock:
     e._spec_class = ray.actor.ActorHandle
     e._port_cursor = port_seed
 
-    def _alloc(start_port: int = 15000, count: int = 1):
+    async def _alloc(start_port: int = 15000, count: int = 1):
         port = max(e._port_cursor, start_port)
         e._port_cursor = port + count
         return port
@@ -342,12 +349,3 @@ def fake_engine(host: str = "10.0.0.1", port_seed: int = 30000) -> MagicMock:
     e._get_free_port_block.remote.side_effect = _alloc
     e._get_node_ip.remote.side_effect = _probe
     return e
-
-
-@pytest.fixture
-def patch_ray_get(monkeypatch):
-    """Make ``ray.get(remote_call(...))`` return the MagicMock's value directly,
-    so allocator tests don't need a real Ray cluster."""
-    import miles.utils.workers.addr_allocator as mod
-
-    monkeypatch.setattr(mod.ray, "get", lambda x: x)

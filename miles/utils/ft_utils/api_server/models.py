@@ -23,7 +23,7 @@ class _OkResponse(StrictBaseModel):
 
 
 class CellCondition(StrictBaseModel):
-    type: Literal["Allocated", "Healthy"]
+    type: Literal["Allocated", "Healthy", "Serving"]
     status: TriState
     reason: str | None = None
     message: str | None = None
@@ -37,10 +37,25 @@ class CellCondition(StrictBaseModel):
     def healthy(cls, status: TriState, *, reason: str | None = None) -> CellCondition:
         return cls(type="Healthy", status=status, reason=reason)
 
+    @classmethod
+    def serving(cls, status: TriState) -> CellCondition:
+        return cls(type="Serving", status=status)
+
+    @classmethod
+    def from_health_checker_status(cls, status: TriState) -> CellCondition:
+        match status:
+            case TriState.FALSE:
+                return cls.healthy(TriState.FALSE, reason="HealthCheckFailed")
+            case TriState.UNKNOWN:
+                return cls.healthy(TriState.UNKNOWN, reason="HealthCheckUnknown")
+            case TriState.TRUE:
+                return cls.healthy(TriState.TRUE)
+
 
 class CellStatus(StrictBaseModel):
     phase: Literal["Pending", "Running", "Suspended"]
     conditions: list[CellCondition]
+    workers_hash: str
 
 
 class CellSpec(StrictBaseModel):

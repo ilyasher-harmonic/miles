@@ -33,21 +33,39 @@ class SchedulingSpec(FrozenStrictBaseModel):
     num_cells: int
     num_workers_per_cell: int
     num_gpus_per_worker: float
+    num_cpus_per_worker: float = 0.2
+    num_gpu_slots_per_worker: int = 0
+    pg_name: str | None = None
+    pg_slot_offset: int = 0
+    pin_to_head: bool = False
 
     @classmethod
-    def single(cls, num_gpus_per_worker: float) -> "SchedulingSpec":
+    def single(cls, num_gpus_per_worker: float, pin_to_head: bool = False) -> "SchedulingSpec":
         return SchedulingSpec(
             num_cells=1,
             num_workers_per_cell=1,
             num_gpus_per_worker=num_gpus_per_worker,
+            pin_to_head=pin_to_head,
         )
+
+
+# TODO: improve meta computation logic later
+class WorkerMetaContext(FrozenStrictBaseModel):
+    cell_index: int
+
+
+class WorkerLaunchContext(FrozenStrictBaseModel):
+    cell_index: int
+    worker_in_cell_index: int
+    gpu_ids: list[int]
 
 
 class BaseWorkerSpec(FrozenStrictBaseModel):
     name: str
     port_infos: list[PortInfo]
-    env_var: Callable[[], dict[str, str]]
+    env_var: Callable[[WorkerLaunchContext], dict[str, str]]
     scheduling: SchedulingSpec
+    meta: Callable[[WorkerMetaContext], dict[str, Any]] | None = None
 
 
 class HostAndPort(FrozenStrictBaseModel):
@@ -63,12 +81,10 @@ class HostAndPort(FrozenStrictBaseModel):
 NamedHostAndPorts = dict[str, HostAndPort]
 
 
-class LaunchCommandContext(FrozenStrictBaseModel):
-    cell_index: int
-    worker_in_cell_index: int
+class LaunchCommandContext(WorkerLaunchContext):
     self_addrs: NamedHostAndPorts
-    spec_addrs: dict[str, list[NamedHostAndPorts]]
-    gpu_ids: list[int]
+    pool_addrs: dict[str, list[NamedHostAndPorts]]
+    local_gpu_ids: list[int]
 
 
 class CommandWorkerSpec(BaseWorkerSpec):
@@ -77,7 +93,24 @@ class CommandWorkerSpec(BaseWorkerSpec):
 
 class ServeWorkerSpec(BaseWorkerSpec):
     worker_class: str
-    ctor_kwargs: Callable[[], dict[str, Any]]
+    ctor_kwargs: Callable[[WorkerLaunchContext], dict[str, Any]]
+    concurrency_groups: dict[str, int] | None = None
+    method_concurrency_groups: dict[str, str] | None = None
+
+    @model_validator(mode="after")
+    def _require_the_groups_and_their_methods_together(self) -> "ServeWorkerSpec":
+        assert (self.concurrency_groups is None) == (self.method_concurrency_groups is None), (
+            f"Worker {self.name!r} must declare concurrency_groups and method_concurrency_groups "
+            f"together: groups nobody is assigned to are dead weight, and a method assigned to a "
+            f"group the actor never declares makes Ray reject the actor"
+        )
+        assert self.method_concurrency_groups is None or set(self.method_concurrency_groups.values()) <= set(
+            self.concurrency_groups
+        ), (
+            f"Worker {self.name!r} routes methods to undeclared concurrency groups: "
+            f"{sorted(set(self.method_concurrency_groups.values()) - set(self.concurrency_groups))}"
+        )
+        return self
 
     @model_validator(mode="before")
     @classmethod

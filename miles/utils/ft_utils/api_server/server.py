@@ -3,17 +3,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
+from collections.abc import Callable
 
 import uvicorn
 from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse
 
-from miles.ray.train.group import RayTrainGroup
-from miles.utils.ft_utils.api_server.handles import _ActorCellHandle, _CellHandle, _RolloutCellHandle
+from miles.ray.specs.inference import compute_engine_pool_ids
+from miles.ray.specs.train import compute_trainer_pool_id
+from miles.ray.train.group import TrainerController
+from miles.utils.ft_utils.api_server.handles import _CellHandler
 from miles.utils.ft_utils.api_server.models import Cell, CellList, CellPatch, FaultInjection, K8sStatus, _OkResponse
 from miles.utils.ft_utils.api_server.registry import _CellRegistry
+from miles.utils.workers.ray_worker_manager import RayWorkerManager
 
 logger = logging.getLogger(__name__)
+
+_API_SERVER_STARTUP_TIMEOUT_SECONDS = 30.0
+_THREAD_READY_POLL_INTERVAL_SECONDS = 0.05
 
 
 # -------------------------- entrypoint ------------------------------
@@ -21,39 +29,54 @@ logger = logging.getLogger(__name__)
 
 def start_api_server(
     *,
-    actor_model: RayTrainGroup,
+    args,
+    actor_model: TrainerController,
     inference_controller: object,
+    host: str = "127.0.0.1",
     port: int,
     ft_components: list[str],
 ) -> None:
-    registry = _CellRegistry()
+    controller_loop = asyncio.get_running_loop()
+    handlers: list[_CellHandler] = []
 
     if "train" in ft_components:
-        for i in range(len(actor_model._cells)):
-            registry.register(_ActorCellHandle(group=actor_model, cell_index=i))
+        handlers.append(
+            _CellHandler(
+                cell_type="actor",
+                worker_manager=RayWorkerManager.get_handle(),
+                controller=actor_model,
+                pool_ids=[compute_trainer_pool_id("actor")],
+            )
+        )
 
     if "rollout" in ft_components:
-        # TODO the code will NOT work before implementing rollout ft
-        for rollout_cell_id in inference_controller.list_cell_ids():
-            registry.register(
-                _RolloutCellHandle(
-                    inference_controller=inference_controller,
-                    rollout_cell_id=rollout_cell_id,
-                )
+        handlers.append(
+            _CellHandler(
+                cell_type="rollout",
+                worker_manager=RayWorkerManager.get_handle(),
+                controller=inference_controller,
+                pool_ids=compute_engine_pool_ids(args),
+                # TEMPORARY: routed through the controller so a suspend takes the lock the weight update holds,
+                # reverted with the weight-update fault tolerance work
+                cell_operations=inference_controller,
+                cell_operations_loop=controller_loop,
             )
+        )
 
-    _start_api_server_raw(registry=registry, port=port)
+    _start_api_server_raw(registry=_CellRegistry(handlers), host=host, port=port)
 
 
-def _start_api_server_raw(registry: _CellRegistry, port: int) -> None:
+def _start_api_server_raw(*, registry: _CellRegistry, port: int, host: str) -> uvicorn.Server:
     app = _create_api_app(registry)
 
-    def _run() -> None:
-        uvicorn.run(app, host="0.0.0.0", port=port)
-
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-    logger.info("Api server started on port %d", port)
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port))
+    _start_and_wait_thread(
+        target=server.run,
+        is_ready=lambda: server.started,
+        description=f"Api server on port {port}",
+        timeout_seconds=_API_SERVER_STARTUP_TIMEOUT_SECONDS,
+    )
+    return server
 
 
 # -------------------------- main app ------------------------------
@@ -79,38 +102,36 @@ def _create_api_app(registry: _CellRegistry) -> FastAPI:
 
     @app.get("/api/v1/cells")
     async def get_cells() -> CellList:
-        handles = registry.get_all()
-        cells = list(await asyncio.gather(*(h.get_cell() for h in handles)))
-        return CellList(items=cells)
+        return CellList(items=await registry.list_cells())
 
     @app.get("/api/v1/cells/{name}")
     async def get_cell(name: str) -> Cell:
-        handle = _get_handle(name)
-        return await handle.get_cell()
+        handler = await _resolve(name)
+        return await handler.get_cell(name)
 
     @app.patch("/api/v1/cells/{name}")
     async def patch_cell(name: str, body: CellPatch) -> Cell:
-        handle = _get_handle(name)
+        handler = await _resolve(name)
 
         if body.spec is not None and body.spec.suspend is not None:
             try:
                 if body.spec.suspend:
-                    await handle.suspend()
+                    await handler.suspend(name)
                 else:
-                    await handle.resume()
+                    await handler.resume(name)
             except Exception as err:
                 logger.error("Failed to patch cell %s", name, exc_info=True)
                 raise _K8sError(
                     status_code=500, reason="InternalError", message=f"Failed to patch cell '{name}'"
                 ) from err
 
-        return await handle.get_cell()
+        return await handler.get_cell(name)
 
     @app.post("/api/v1/cells/{name}/inject-fault")
     async def inject_fault(name: str, body: FaultInjection) -> _OkResponse:
-        handle = _get_handle(name)
+        handler = await _resolve(name)
         try:
-            await handle.inject_fault(mode=body.mode, sub_index=body.sub_index)
+            await handler.inject_fault(name, mode=body.mode, sub_index=body.sub_index)
         except NotImplementedError as err:
             raise _K8sError(
                 status_code=400,
@@ -128,9 +149,9 @@ def _create_api_app(registry: _CellRegistry) -> FastAPI:
 
     # -------------------------- utils ------------------------------
 
-    def _get_handle(name: str) -> _CellHandle:
+    async def _resolve(name: str) -> _CellHandler:
         try:
-            return registry.get(name)
+            return await registry.resolve(name)
         except KeyError:
             raise _K8sError(status_code=404, reason="NotFound", message=f"Cell '{name}' not found") from None
 
@@ -145,3 +166,39 @@ class _K8sError(Exception):
         self.status_code = status_code
         self.reason = reason
         self.message = message
+
+
+# -------------------------- thread startup ------------------------------
+
+
+def _start_and_wait_thread(
+    *,
+    target: Callable[[], None],
+    is_ready: Callable[[], bool],
+    description: str,
+    timeout_seconds: float,
+) -> threading.Thread:
+    error: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            target()
+        except BaseException as err:  # noqa: BLE001 - re-raised on the caller thread below
+            logger.error("%s died", description, exc_info=True)
+            error.append(err)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    deadline = time.monotonic() + timeout_seconds
+    while not is_ready():
+        if error:
+            raise RuntimeError(f"{description} failed during startup") from error[0]
+        if not thread.is_alive():
+            raise RuntimeError(f"{description} exited during startup")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"{description} did not finish startup within {timeout_seconds}s")
+        time.sleep(_THREAD_READY_POLL_INTERVAL_SECONDS)
+
+    logger.info("%s started", description)
+    return thread

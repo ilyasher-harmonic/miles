@@ -8,7 +8,7 @@ from typing import Any
 
 import ray
 
-from miles.utils.misc import get_current_node_ip, get_free_port
+from miles.utils.misc import NodeProbeMixin, get_free_port
 from miles.utils.test_utils.mock_sglang_http_server import MockSGLangHttpServer
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,9 @@ class MockSGLangEngine:
         else:
             self._faults[method] = exception
 
+    def inject_fault(self, mode: str) -> None:
+        self._record("inject_fault", (), {"mode": mode})
+
     def get_calls(self) -> list[tuple[str, tuple, dict]]:
         return list(self.calls)
 
@@ -90,7 +93,15 @@ class MockSGLangEngine:
 
     def _get_node_ip(self):
         self._record("_get_node_ip", (), {})
-        return "127.0.0.1"
+        return NodeProbeMixin._get_node_ip()
+
+    def _to_local_gpu_ids(self, *, gpu_ids: list[int]) -> list[int]:
+        self._record("_to_local_gpu_ids", (), {"gpu_ids": gpu_ids})
+        return list(range(len(gpu_ids)))
+
+    def _is_port_available(self, *, port: int) -> bool:
+        self._record("_is_port_available", (), {"port": port})
+        return True
 
     def _get_gpu_uuids(self, gpu_ids: list[int]):
         self._record("_get_gpu_uuids", (gpu_ids,), {})
